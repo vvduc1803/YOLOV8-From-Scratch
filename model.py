@@ -73,19 +73,15 @@ class SPPFBlock(nn.Module):
         return x
 
 class DetectBlock(nn.Module):
-    def __init__(self, in_chan, num_classes=80, regmax=16):
+    def __init__(self, in_chan, num_classes=80):
         super().__init__()
-        self.box_branch = nn.Sequential(CNNBlock(in_chan, in_chan, kernel_size=3, stride=1, padding=1),
-                                        CNNBlock(in_chan, in_chan, kernel_size=3, stride=1, padding=1),
-                                        nn.Conv2d(in_chan, regmax*4, kernel_size=1, stride=1, padding=0))
 
-        self.class_branch = nn.Sequential(CNNBlock(in_chan, in_chan, kernel_size=3, stride=1, padding=1),
-                                        CNNBlock(in_chan, in_chan, kernel_size=3, stride=1, padding=1),
-                                        nn.Conv2d(in_chan, num_classes, kernel_size=1, stride=1, padding=0))
+        self.detect = nn.Sequential(CNNBlock(in_chan, in_chan, kernel_size=3, stride=1, padding=1),
+                                    CNNBlock(in_chan, in_chan, kernel_size=3, stride=1, padding=1),
+                                    nn.Conv2d(in_chan, num_classes + 4, kernel_size=1, stride=1, padding=0))
     def forward(self, x):
-        x_box = self.box_branch(x)
-        x_class = self.class_branch(x)
-        return x_box, x_class
+        x = self.detect(x)
+        return x
 
 class MyModel(nn.Module):
     def __init__(self, in_chan, hidden=64, num_classes=80):
@@ -159,9 +155,9 @@ class MyModel(nn.Module):
 
         x2 = self.Block11(x2)
 
-        outL = (boxL, classL) = self.Detect_L(x)
-        outM = (boxM, classM) = self.Detect_M(x1)
-        outS = (boxS, classS) = self.Detect_S(x2)
+        outL = self.Detect_L(x)
+        outM = self.Detect_M(x1)
+        outS = self.Detect_S(x2)
 
         return [outL, outM, outS]
 
@@ -169,8 +165,8 @@ def test():
     x = torch.rand((1, 3, 640, 640))
     model = MyModel(3, )
     y = model(x)
-    print(y[0][0].shape)
-    summary(model , (1, 3, 640, 640))
+    print(y[0].shape)
+    # summary(model, (1, 3, 640, 640))
 
 if __name__ == '__main__':
     test()
