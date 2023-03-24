@@ -3,35 +3,43 @@ import torch
 from PIL import Image
 import numpy as np
 import os
+import json
 from metrics import iou_width_height as iou
 
 class MyDataset(Dataset):
-    def __init__(self, img_dir, label_dir, S, anchors, num_classes = 20, image_size=416, transform=None, threshold=0.5):
-        self.label_dir = label_dir
+    def __init__(self, img_dir, json_file, strides=[8, 16, 32], reg_max=16, num_classes=80, image_size=640, transform=None, threshold=0.5):
+        self.json_dir = json_file
         self.img_dir = img_dir
         self.img_list = os.listdir(img_dir)
-        self.label_list = os.listdir(label_dir)
-        self.image_size = image_size
+        self.reg_max = reg_max
+        self.img_size = image_size
         self.transform = transform
-        self.input_sizes = S
+        self.strides = strides
         self.num_classes = num_classes
-        # self.anchors = torch.tensor(anchors[0] + anchors[1] + anchors[2])
-        # self.num_anchors = self.anchors.shape[0]
-        # self.number_anchors_per_scale = self.num_anchors // 3
         self.threshold = threshold
 
 
     def __len__(self):
-        return len(self.label_list)
+        return len(self.img_list)
 
     def __getitem__(self, idx):
-        # Extract label and bbox of objects in file csv
-        label_path = os.path.join(self.label_dir, self.label_list[idx])
-        bboxes = np.roll(np.loadtxt(fname=label_path, delimiter=" ", ndmin=2), 4, 1).tolist()
-
         # Take picture
         image_path = os.path.join(self.img_dir, self.img_list[idx])
         image = np.array(Image.open(image_path))
+
+
+        # Extract label and bbox of objects in file csv
+        json_dir = open(self.json_dir, 'r')
+        json_file = json.load(json_dir)
+        images_info, annotations = json_file['images'], json_file['annotations']
+        image_info = [[image['id'], image['width'], image['height']]
+                    for image in images_info if image['file_name'] == f'{self.img_list[idx]}'][0]
+
+        bboxes = [sum([anno['bbox'], [anno['category_id']]], [])
+                  for anno in annotations
+                  if anno['image_id'] == image_info[0]]
+
+        self.class_idx = [i['id'] for i in json_file['categories']]
 
         # Transform image and bounding boxes
         if self.transform:
@@ -39,39 +47,38 @@ class MyDataset(Dataset):
             image = augmentation['image']
             bboxes = augmentation['bboxes']
 
-        # Below assumes 3 scale predictions (as paper) and same num of anchors per scale
-            # Create empty target tensors for each scale
-        targets = []
-        for input_size in self.input_sizes:
-            target = torch.zeros((self.num_classes + 5, input_size, input_size))
-            targets.append(target)
-        
-        for bbox in bboxes:
-            iou_anchors = iou(torch.tensor(bbox[2:4]), self.anchors)
-            anchors_indices = torch.argsort(iou_anchors, dim=0, descending=True)
-            has_anchors = [False]*3
-            x, y, width, height, class_label = bbox
+        targets = self.convert_labels_to_target(bboxes)
 
-            for anchors_index in anchors_indices:
-                scale_index = anchors_index // self.number_anchors_per_scale
-                anchor_on_scale = scale_index % self.number_anchors_per_scale
-                S = self.S[scale_index]
-                i, j = int(S * x), int(S * y)
-                anchor_taken = targets[scale_index][anchor_on_scale, j, i, 0]
-                if not anchor_taken and not has_anchors[scale_index]:
-                    targets[scale_index][anchor_on_scale, j, i, 0] = 1
+        return image, targets
 
-                    x_cell, y_cell, width_cell, height_cell = S*x - i, S*y -j, width*S, height*S
-                    box = torch.tensor([x_cell, y_cell, width_cell, height_cell])
-                    targets[scale_index][anchor_on_scale, j, i, 1:5] = box
-                    targets[scale_index][anchor_on_scale, j, i, 5] = class_label
+    def convert_labels_to_target(self, bboxes):
+        targets = [torch.zeros((grid_size, grid_size, self.num_classes + 5)) for grid_size in (8, 16, 32)]
+        for box in bboxes:
+            x, y, w, h, class_label = box
+            xc, yc = x + w / 2, y + h / 2
 
-                    has_anchors[scale_index] = True
+            for i, grid_size in enumerate((8, 16, 32)):
+                if grid_size == 8:
+                    anchor_idxs = [0, 1, 2]
+                elif grid_size == 16:
+                    anchor_idxs = [3, 4, 5]
+                else:
+                    anchor_idxs = [6, 7, 8]
 
-                if not anchor_taken and iou_anchors[scale_index] > self.threshold:
-                    targets[scale_index][anchor_on_scale, j, i, 0] = -1
+                stride = self.image_size // grid_size
+                x_cell, y_cell = int(xc / stride), int(yc / stride)
+                grid_x, grid_y = xc / stride - x_cell, yc / stride - y_cell
+
+                for idx in anchor_idxs:
+                    if targets[i][x_cell, y_cell, 20] == 0:
+                        targets[i][x_cell, y_cell, 20] = 1
+                        targets[i][x_cell, y_cell, 21:25] = torch.tensor([x, y, w, h])
+                        targets[i][x_cell, y_cell, int(class_label)] = 1
 
         return image, tuple(targets)
 
-a = MyDataset('image', 'labels', [32, 16, 8], None)
-a.__getitem__(0)
+
+
+a = MyDataset('coco2017/val2017', 'coco2017/annotations/instances_val2017.json')
+x, b = a.__getitem__(0)
+print(len(b))

@@ -4,11 +4,12 @@
 """
 import torch
 import torch.nn as nn
+from torchinfo import summary
 
 
 class CNNBlock(nn.Module):
     """Base block in CNN"""
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bn_act=True):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=2, padding=1, bn_act=True):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, bias=not bn_act)
         self.bn = nn.BatchNorm2d(out_channels)
@@ -18,8 +19,8 @@ class CNNBlock(nn.Module):
     def forward(self, x):
         if self.use_bn_act:
             x = self.silu(self.bn(self.conv(x)))
-
             return x
+
         else:
             return self.conv(x)
 
@@ -37,37 +38,23 @@ class BottleNeckBlock(nn.Module):
             return self.Conv(x)
 
 class C2FBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, **kwargs):
+    def __init__(self, in_channels, out_channels, repeat=3, **kwargs):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.Conv = CNNBlock(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-        self.Conv_end = CNNBlock(int(0.5*(1+2)*out_channels), out_channels, kernel_size=1, stride=1, padding=0)
+        self.Conv_end = CNNBlock(int(0.5*(repeat+2)*out_channels), out_channels, kernel_size=1, stride=1, padding=0)
         self.BottleNeck = BottleNeckBlock(out_channels//2, **kwargs)
+        self.repeat = repeat
 
     def forward(self, x):
         x = self.Conv(x)
         x, x1 = torch.split(x, self.out_channels//2, dim=1)
-        x2 = self.BottleNeck(x1)
-        x = torch.cat([x, x1, x2], dim=1)
-        x = self.Conv_end(x)
-        return x
-
-class C2F_2_Block(nn.Module):
-    def __init__(self, in_channels, out_channels, **kwargs):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.Conv = CNNBlock(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
-        self.Conv_end = CNNBlock(int(0.5*(2+2)*out_channels), out_channels, kernel_size=1, stride=1, padding=0)
-        self.BottleNeck = BottleNeckBlock(out_channels//2, **kwargs)
-
-    def forward(self, x):
-        x = self.Conv(x)
-        x, x1 = torch.split(x, self.out_channels//2, dim=1)
-        x2 = self.BottleNeck(x1)
-        x3 = self.BottleNeck(x2)
-        x = torch.cat([x, x1, x2, x3], dim=1)
+        x = torch.cat([x, x1], dim=1)
+        for i in range(self.repeat):
+            x2 = self.BottleNeck(x1)
+            x = torch.cat([x, x2], dim=1)
+            x1 = x2
         x = self.Conv_end(x)
         return x
 
@@ -85,95 +72,106 @@ class SPPFBlock(nn.Module):
         x = self.Conv_end(x)
         return x
 
-class Classifier(nn.Module):
-    def __init__(self, num_classes=500):
+class DetectBlock(nn.Module):
+    def __init__(self, in_chan, num_classes=80, regmax=16):
         super().__init__()
-        self.Conv = nn.Sequential(CNNBlock(512, 1280, kernel_size=1, stride=1, padding=0))
-        self.Flatten = nn.Flatten()
-        self.Linear = nn.Sequential(nn.Linear(62720, num_classes))
+        self.box_branch = nn.Sequential(CNNBlock(in_chan, in_chan, kernel_size=3, stride=1, padding=1),
+                                        CNNBlock(in_chan, in_chan, kernel_size=3, stride=1, padding=1),
+                                        nn.Conv2d(in_chan, regmax*4, kernel_size=1, stride=1, padding=0))
 
+        self.class_branch = nn.Sequential(CNNBlock(in_chan, in_chan, kernel_size=3, stride=1, padding=1),
+                                        CNNBlock(in_chan, in_chan, kernel_size=3, stride=1, padding=1),
+                                        nn.Conv2d(in_chan, num_classes, kernel_size=1, stride=1, padding=0))
     def forward(self, x):
-        x = self.Conv(x)
-        x = self.Flatten(x)
-        x = self.Linear(x)
-        return x
+        x_box = self.box_branch(x)
+        x_class = self.class_branch(x)
+        return x_box, x_class
 
-class Yolov8_cls(nn.Module):
-    """Model architecture based page: https://blog.roboflow.com/whats-new-in-yolov8/
-       and the ONNX file of yolov8_cls.onnx"""
-
-    def __init__(self, in_channels, num_classes=500):
+class MyModel(nn.Module):
+    def __init__(self, in_chan, hidden=64, num_classes=80):
         super().__init__()
-        self.Block1 = nn.Sequential(CNNBlock(in_channels, 32, 3, 2, 1),
-                                    CNNBlock(32, 64, 3, 2, 1))
-
-        self.Block2 = C2FBlock(64, 64)
-
-        self.Block3 = nn.Sequential(CNNBlock(64, 128, 3, 2, 1),
-                                    C2F_2_Block(128, 128))
-
-        self.Block4 = nn.Sequential(CNNBlock(128, 256, 3, 2, 1),
-                                    C2F_2_Block(256, 256))
-
-        self.Block5 = nn.Sequential(CNNBlock(256, 512, 3, 2, 1),
-                                    C2F_2_Block(512, 512))
-
-        self.Block6 = Classifier(num_classes)
-
-    def forward(self, x):
-        x = self.Block1(x)
-        x = self.Block2(x)
-        x = self.Block3(x)
-        x = self.Block4(x)
-        x = self.Block5(x)
-        x = self.Block6(x)
-        return x
-
-class AnchorFreeYOLOv5(nn.Module):
-    def __init__(self, num_classes=80, num_anchor_boxes=3):
-        super(AnchorFreeYOLOv5, self).__init__()
-
-        # Replace anchor boxes with center points
-        self.head = nn.Sequential(
-            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(inplace=True),
-            nn.Conv2d(256, num_anchor_boxes * (num_classes + 4), kernel_size=1, stride=1)
-        )
-
         self.num_classes = num_classes
-        self.num_anchor_boxes = num_anchor_boxes
+
+        self.Block1 = nn.Sequential(CNNBlock(in_chan, hidden),
+                                    CNNBlock(hidden, hidden*2),
+                                    C2FBlock(hidden*2, hidden*2),
+                                    CNNBlock(hidden*2, hidden*4),
+                                    C2FBlock(hidden*4, hidden*4, repeat=6))
+
+        self.Block2 = nn.Sequential(CNNBlock(hidden*4, hidden*8),
+                                    C2FBlock(hidden*8, hidden*8, repeat=6))
+
+        self.Block3 = nn.Sequential(CNNBlock(hidden*8, hidden*8),
+                                    C2FBlock(hidden*8, hidden*8),
+                                    SPPFBlock(hidden*8))
+
+        self.Block4 = nn.Upsample(scale_factor=2)
+
+        self.Block5 = C2FBlock(hidden*16, hidden*8, repeat=3, short_cut=False)
+
+        self.Block6 = nn.Upsample(scale_factor=2)
+
+        self.Block7 = C2FBlock(hidden*12, hidden*4, short_cut=False)
+
+        self.Block8 = CNNBlock(hidden*4, hidden*4)
+
+        self.Block9 = C2FBlock(hidden*12, hidden*8, short_cut=False)
+
+        self.Block10 = CNNBlock(hidden*8, hidden*8)
+
+        self.Block11 = C2FBlock(hidden*16, hidden*8, short_cut=False)
+
+        self.Detect_L = DetectBlock(hidden*4)
+
+        self.Detect_M = DetectBlock(hidden*8)
+
+        self.Detect_S = DetectBlock(hidden*8)
 
     def forward(self, x):
-        x = self.head(x)
 
-        batch_size, _, height, width = x.shape
+        x = self.Block1(x)
 
-        # Reshape output to match expected format
-        x = x.view(batch_size, self.num_anchor_boxes, self.num_classes + 4, height, width)
+        x1 = self.Block2(x)
 
-        # Split the predicted outputs into objectness, class probabilities, and bounding box coordinates
-        objectness = torch.sigmoid(x[:, :, 0:1, :, :])
-        class_probs = torch.sigmoid(x[:, :, 1:self.num_classes + 1, :, :])
-        bbox_center = torch.exp(x[:, :, -4:, :, :])
-        bbox_size = torch.exp(x[:, :, -3:-1, :, :])
-        bbox_offset = x[:, :, -1:, :, :]
+        x2 = self.Block3(x1)
 
-        # Calculate the actual bounding box coordinates using the center points and offsets
-        strides = [8, 16, 32]
-        grid_x, grid_y = torch.meshgrid(torch.arange(height), torch.arange(width))
-        grid_xy = torch.stack([grid_x, grid_y], dim=-1).float().to(x.device)
+        x3 = self.Block4(x2)
 
-        bbox_xy = (bbox_center * strides + grid_xy + bbox_offset) * strides
-        bbox_wh = bbox_size * strides
+        x1 = torch.cat([x1, x3], dim=1)
 
-        # Combine the predicted outputs into a single tensor
-        bbox = torch.cat([bbox_xy, bbox_wh], dim=-1)
-        output = torch.cat([objectness, bbox, class_probs], dim=-1)
+        x1 = self.Block5(x1)
 
-        return output.permute(0, 3, 4, 1, 2)
+        x3 = self.Block6(x1)
 
-model = AnchorFreeYOLOv5()
-input_data = torch.randn(1, 256, 32, 32)
-output = model(input_data)
-print(output)
+        x = torch.cat([x, x3], dim=1)
+
+        x = self.Block7(x)
+
+        x3 = self.Block8(x)
+
+        x1 = torch.cat([x1, x3], dim=1)
+
+        x1 = self.Block9(x1)
+
+        x3 = self.Block10(x1)
+
+        x2 = torch.cat([x2, x3], dim=1)
+
+        x2 = self.Block11(x2)
+
+        outL = (boxL, classL) = self.Detect_L(x)
+        outM = (boxM, classM) = self.Detect_M(x1)
+        outS = (boxS, classS) = self.Detect_S(x2)
+
+        return [outL, outM, outS]
+
+def test():
+    x = torch.rand((1, 3, 640, 640))
+    model = MyModel(3, )
+    y = model(x)
+    print(y[0][0].shape)
+    summary(model , (1, 3, 640, 640))
+
+if __name__ == '__main__':
+    test()
+
